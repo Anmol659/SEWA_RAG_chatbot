@@ -21,3 +21,17 @@ ctransformers
 
 # --- Data Validation (used by FastAPI) ---
 pydantic
+
+# --- Real-time Data Tools ---
+openmeteo-requests
+requests-cache
+retry-requests
+requests
+beautifulsoup4
+pandas
+numpy
+
+# --- Pest Detection Model ---
+torch
+torchvision
+Pillow
