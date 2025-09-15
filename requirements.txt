@@ -1,0 +1,23 @@
+# requirements.txt
+
+# --- Core Web Framework ---
+fastapi
+uvicorn[standard]
+
+# --- LangChain RAG Framework ---
+langchain
+langchain_community
+
+# --- Vector Store & Embeddings ---
+faiss-cpu
+sentence-transformers
+
+# --- Document Loaders ---
+pypdf
+python-multipart
+
+# --- LLM Loader (for running local GGUF models) ---
+ctransformers
+
+# --- Data Validation (used by FastAPI) ---
+pydantic
