@@ -1,51 +1,66 @@
+import os
+import torch
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.llms import CTransformers
 from langchain.chains.retrieval_qa.base import RetrievalQA
-import os
 
 # --- Configuration ---
 VECTORSTORE_PATH = "vectorstore/faiss_index_agri"
 MODEL_PATH = "models/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
+# --- Device Setup ---
+DEVICE = "cpu"
+print(f"🔹 Forcing device: {DEVICE}")
+
 def load_llm():
-    """
-    Loads the quantized Mistral-7B model using CTransformers.
-    Configured for CPU execution and optimized for a balance of speed and quality.
-    """
+    """Loads the quantized Mistral-7B model using CTransformers."""
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"LLM model file not found at {MODEL_PATH}. Please download it from Hugging Face.")
-        
+        raise FileNotFoundError(
+            f"LLM model file not found at {MODEL_PATH}. "
+            "Please download it and place it in the 'models' directory."
+        )
+    
     llm = CTransformers(
         model=MODEL_PATH,
         model_type="mistral",
-        config={'max_new_tokens': 1024, 'temperature': 0.7, 'context_length': 4096}
+        config={
+            'max_new_tokens': 1024,
+            'temperature': 0.7,
+            'context_length': 4096
+        },
+        # Explicitly set gpu_layers to 0 to force CPU usage
+        gpu_layers=0  
     )
     return llm
 
 def create_rag_chain():
-    """
-    Initializes and returns the complete RAG (Retrieval-Augmented Generation) chain.
-    This function sets up the retriever, the prompt template, and combines them
-    with the LLM to form the question-answering system.
-    """
-    # 1. Load Embeddings and Vector Store
+    """Initializes and returns the RAG components."""
+    print("Loading embedding model...")
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
-        model_kwargs={'device': 'cpu'}
+        model_kwargs={'device': DEVICE}
     )
+    print("✅ Embedding model loaded.")
     
     if not os.path.exists(VECTORSTORE_PATH):
-         raise FileNotFoundError(f"Vector store not found at {VECTORSTORE_PATH}. Please run create_vectorstore.py first.")
+        raise FileNotFoundError(
+            f"Vector store not found at {VECTORSTORE_PATH}. "
+            "Please run create_vectorstore.py first."
+        )
 
-    vectorstore = FAISS.load_local(VECTORSTORE_PATH, embeddings, allow_dangerous_deserialization=True)
+    print("Loading vector store...")
+    vectorstore = FAISS.load_local(
+        VECTORSTORE_PATH,
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+    print("✅ Vector store loaded.")
     
-    # 2. Create Retriever
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-
-    # 3. Define the Prompt Template (Modified for two-part answers)
+    
     prompt_template = """
     First, provide a direct and concise answer to the user's question about farming in Punjab using the context below.
     Then, add the separator '---' and provide a more detailed, step-by-step explanation based on the same context.
@@ -59,10 +74,10 @@ def create_rag_chain():
     """
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
-    # 4. Load the LLM
+    print("Loading LLM... (This may take a moment)")
     llm = load_llm()
+    print("✅ LLM loaded.")
 
-    # 5. Create the RAG Chain
     rag_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
@@ -73,27 +88,55 @@ def create_rag_chain():
     
     return rag_chain
 
+def stream_rag_response(query: str, chain: RetrievalQA):
+    """
+    Performs the RAG steps and yields the LLM's response token by token.
+    
+    Args:
+        query: The user's question.
+        chain: The pre-configured RetrievalQA chain.
+
+    Yields:
+        str: Each token of the generated response.
+    """
+    try:
+        # 1. Retrieve relevant documents
+        docs = chain.retriever.invoke(query)
+        
+        if not docs:
+            yield "I couldn't find specific information on that topic in my knowledge base."
+            return
+
+        # 2. Format the context for the prompt
+        context = "\n\n".join([doc.page_content for doc in docs])
+        
+        # 3. Create the final prompt with the retrieved context
+        final_prompt = chain.combine_documents_chain.llm_chain.prompt.format(context=context, question=query)
+
+        # 4. Stream the response from the LLM
+        llm = chain.combine_documents_chain.llm_chain.llm
+        for token in llm.stream(final_prompt):
+            yield token
+    except Exception as e:
+        print(f"Error during streaming: {e}")
+        yield "An error occurred while generating the response."
+
+# This block is for direct testing and will not be used by the main FastAPI app.
 if __name__ == "__main__":
-    # This block is for testing the RAG pipeline directly
-    print("--- Testing RAG Pipeline ---")
+    print("--- Testing RAG Pipeline Streaming ---")
     try:
         chain = create_rag_chain()
-        print("RAG chain created successfully.")
+        print("\n✅ RAG chain created successfully.")
         
-        # Example query in English
         query_en = "What is the best fertilizer for wheat in Punjab?"
-        print(f"\nTesting with English query: '{query_en}'")
-        result_en = chain.invoke({"query": query_en})
-        print("\n--- English Response ---")
-        print(result_en['result'])
-
-        # Example query in Punjabi
-        query_pu = "ਪੰਜਾਬ ਵਿੱਚ ਕਣਕ ਲਈ ਸਭ ਤੋਂ ਵਧੀਆ ਖਾਦ ਕਿਹੜੀ ਹੈ?"
-        print(f"\nTesting with Punjabi query: '{query_pu}'")
-        result_pu = chain.invoke({"query": query_pu})
-        print("\n--- Punjabi Response ---")
-        print(result_pu['result'])
+        print(f"\nTesting with query: '{query_en}'")
+        
+        print("\n--- Streamed Response ---")
+        response_stream = stream_rag_response(query_en, chain)
+        for token in response_stream:
+            print(token, end="", flush=True)
+        print("\n--- End of Stream ---")
         
     except Exception as e:
-        print(f"An error occurred during testing: {e}")
+        print(f"\n❌ An error occurred during testing: {e}")
 
