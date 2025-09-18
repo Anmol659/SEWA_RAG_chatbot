@@ -1,143 +1,98 @@
-import os
-import shutil
-import re
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-from typing import Optional, List
+import os
+from typing import Optional
+from pydantic import BaseModel
 
-# Import schemas and the RAG chain creation function
-from .schemas import QueryRequest
-from .rag_pipeline import create_rag_chain
-
-# Import tool functions from the 'tools' directory
-from tools.soil_weather_tool import get_soil_data, PUNJAB_COORDINATES
+# Assume these are your existing modules for the RAG pipeline and tools.
+# No changes are needed in these files.
+from app.rag_pipeline import stream_rag_response
 from tools.market_price_tool import get_mandi_prices
-from tools.pest_detection_tool import get_pest_prediction
+from tools.soil_weather_tool import get_soil_data, PUNJAB_COORDINATES
 
 # --- Application Setup ---
 app = FastAPI(
     title="Smart Crop Advisory API",
-    description="An intelligent, multimodal chatbot backend for farmers in Punjab.",
-    version="1.2.0"
+    description="A multilingual RAG chatbot for farmers that accepts text queries.",
+    version="2.1.1" # Version updated for CORS support
 )
 
-# --- CORS Middleware ---
+# --- Add CORS Middleware ---
+# This is necessary to allow front-end web applications to communicate with this API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8082",                 # React local dev
+        "https://e0081e71da4a.ngrok-free.app"    # current ngrok tunnel
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Global RAG Chain Variable ---
-rag_chain = None
 
-@app.on_event("startup")
-def startup_event():
-    """Load the RAG chain model on application startup."""
-    global rag_chain
-    print("--- Loading RAG Chain on startup ---")
-    try:
-        rag_chain = create_rag_chain()
-        print("--- RAG Chain loaded successfully ---")
-    except Exception as e:
-        print(f"FATAL: Could not load RAG chain on startup. Error: {e}")
-        rag_chain = None
+# --- Request Body Model ---
+class QueryRequest(BaseModel):
+    query: str
 
-# --- Helper functions for Intent Detection ---
-KNOWN_COMMODITIES = ["wheat", "rice", "paddy", "cotton", "maize", "sugarcane"]
+# --- Keywords for Tool Routing ---
+WEATHER_KEYWORDS = ["weather", "temperature", "climate", "forecast", "mausam", "tapman", "jalvayu", "ਮੌਸਮ", "ਤਾਪਮਾਨ"]
+PRICE_KEYWORDS = ["price", "rate", "mandi", "bhav", "kimat", "bazaar", "ਮੁੱਲ", "ਕੀਮਤ", "ਮੰਡੀ", "ਭਾਅ"]
+KNOWN_LOCATIONS = list(PUNJAB_COORDINATES.keys())
+KNOWN_COMMODITIES = ["wheat", "rice", "paddy", "cotton", "maize", "ਕਣਕ", "ਝੋਨਾ", "ਨਰਮਾ", "ਮੱਕੀ", "गेहूं", "धान", "कपास", "मक्का"]
 
-def find_keywords(query: str, keywords: List[str]) -> Optional[str]:
-    """Finds the first matching keyword from a list in the query."""
-    for keyword in keywords:
-        if re.search(r'\b' + re.escape(keyword) + r'\b', query):
-            return keyword
+def extract_entity(query: str, entity_list: list) -> Optional[str]:
+    """
+    Extracts the first matching known entity (like a commodity or location) from a query.
+    Also handles translation of common terms to a standardized English keyword.
+    """
+    for entity in entity_list:
+        if entity in query:
+            # Standardize commodity names
+            if entity in ["ਝੋਨਾ", "धान"]: return "rice"
+            if entity in ["ਕਣਕ", "गेहूं"]: return "wheat"
+            if entity in ["ਨਰਮਾ", "कपास"]: return "cotton"
+            if entity in ["ਮੱਕੀ", "मक्का"]: return "maize"
+            return entity
     return None
 
-# --- API Endpoints ---
-
-@app.get("/", summary="Root endpoint for health check")
-def read_root():
-    """A simple health check endpoint to confirm the API is running."""
-    return {"status": "Smart Crop Advisory API is running."}
-
-@app.post("/ask", summary="Unified endpoint for all queries (Text, Voice, Tools)")
-async def ask_question(request: QueryRequest):
+@app.post("/ask")
+async def ask_endpoint(request: QueryRequest):
     """
-    This intelligent endpoint determines the user's intent and routes the query
-    to the appropriate tool (live data) or the RAG pipeline (knowledge base).
-    """
-    query_lower = request.query.lower()
+    This endpoint processes a text-based query from the user, expecting a JSON body
+    with a "query" field (e.g., {"query": "How to manage wheat rust?"}).
 
-    # --- Intent 1: Check for Weather or Soil Data Request ---
-    if any(keyword in query_lower for keyword in ["weather", "temperature", "soil", "moisture", "climate today", "मौसम", "तापमान", "मिट्टी", "नमी"]):
-        location = find_keywords(query_lower, list(PUNJAB_COORDINATES.keys()))
+    The final response will be generated in the same language as the input query.
+    """
+    final_query_text = request.query.lower()
+    print(f"INFO: Processing query: '{final_query_text}'")
+
+    # Tool Routing: Weather/Soil Data
+    if any(k in final_query_text for k in WEATHER_KEYWORDS):
+        location = extract_entity(final_query_text, KNOWN_LOCATIONS)
         if location:
-            print(f"INFO: Weather/soil intent detected for location: {location}")
-            live_data_report = get_soil_data(location)
-            return {"answer": live_data_report, "source": "Live Weather API"}
+            report = get_soil_data(location)
+            async def gen_report(): yield report
+            return StreamingResponse(gen_report(), media_type="text/plain")
+        # If keyword found but no location, fallback to RAG
 
-    # --- Intent 2: Check for Market Price Request ---
-    if any(keyword in query_lower for keyword in ["price", "mandi", "rate", "bhav", "कीमत", "मंडी", "भाव"]):
-        commodity = find_keywords(query_lower, KNOWN_COMMODITIES)
+    # Tool Routing: Market Prices
+    if any(k in final_query_text for k in PRICE_KEYWORDS):
+        commodity = extract_entity(final_query_text, KNOWN_COMMODITIES)
         if commodity:
-            print(f"INFO: Market price intent detected for commodity: {commodity}")
-            # Assuming Punjab for this project context
-            price_report = get_mandi_prices("punjab", commodity)
-            return {"answer": price_report, "source": "Live Market Price API"}
+            report = get_mandi_prices("punjab", commodity)
+            async def gen_report(): yield report
+            return StreamingResponse(gen_report(), media_type="text/plain")
+        # If keyword found but no commodity, fallback to RAG
 
-    # --- Default: Use RAG for all other knowledge-based questions ---
-    print("INFO: No specific tool intent detected. Routing to RAG pipeline.")
-    if rag_chain is None:
-        raise HTTPException(status_code=503, detail="RAG model is not available. Please check server logs.")
-    try:
-        result = rag_chain.invoke({"query": request.query})
-        return {"answer": result.get('result', 'No result found.'), "source": "Document Knowledge Base"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred during RAG processing: {e}")
+    # --- Default to RAG Pipeline ---
+    # If no specific tools are triggered, use the RAG pipeline for a general response.
+    print("INFO: No specific tool triggered. Routing to RAG pipeline.")
+    return StreamingResponse(stream_rag_response(final_query_text), media_type="text/event-stream")
 
-
-@app.post("/predict-pest", summary="Identify crop disease from an image")
-async def predict_pest(file: UploadFile = File(...)):
-    """Handles image uploads for pest and disease detection."""
-    temp_dir = "temp_uploads"
-    os.makedirs(temp_dir, exist_ok=True)
-    temp_file_path = os.path.join(temp_dir, file.filename)
-
-    try:
-        with open(temp_file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        prediction_result = get_pest_prediction(temp_file_path)
-        return {"prediction": prediction_result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred during pest prediction: {e}")
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-# Keeping these direct tool endpoints can be useful for specific app features or debugging
-@app.get("/market-prices", summary="Directly get latest mandi prices")
-def market_prices(state: str, commodity: str):
-    """Directly calls the market price scraping tool."""
-    try:
-        price_report = get_mandi_prices(state, commodity)
-        return {"report": price_report}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/soil-data", summary="Directly get recent soil data")
-def soil_data(location: str):
-    """Directly calls the soil data tool."""
-    try:
-        soil_report = get_soil_data(location)
-        return {"report": soil_report}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    print("To run the API server, use the command from your project root:")
-    print("uvicorn app.main:app --reload --host 0.0.0.0")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.on_event("startup")
+async def on_startup():
+    print("===== Application Startup =====")
+    print("INFO: FastAPI server with text-only /ask endpoint is ready.")
 

@@ -3,11 +3,10 @@
 # --- Core Web Framework ---
 fastapi
 uvicorn[standard]
-
 # --- LangChain RAG Framework ---
 langchain
 langchain_community
-
+langchain-huggingface
 # --- Vector Store & Embeddings ---
 faiss-cpu
 sentence-transformers
@@ -17,7 +16,7 @@ pypdf
 python-multipart
 
 # --- LLM Loader (for running local GGUF models) ---
-ctransformers
+ctransformers==0.2.27
 
 # --- Data Validation (used by FastAPI) ---
 pydantic
@@ -30,8 +29,13 @@ requests
 beautifulsoup4
 pandas
 numpy
-
 # --- Pest Detection Model ---
-torch
-torchvision
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
 Pillow
+
+transformers
+accelerate
+soundfile
+huggingface_hub
+twilio

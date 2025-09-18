@@ -1,9 +1,9 @@
 import os
+import time
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-import time
 
 # --- Configuration ---
 DATA_PATH = "data/"
@@ -24,13 +24,10 @@ def create_vector_store():
     # 1. Load Documents
     print(f"1. Loading documents from '{DATA_PATH}'...")
     start_time = time.time()
-    # Using DirectoryLoader to recursively find all PDFs
     loader = DirectoryLoader(
         DATA_PATH,
-        glob="**/*.pdf",  # This pattern ensures it searches in all subdirectories
-        loader_cls=PyPDFLoader,
-        show_progress=True,
-        use_multithreading=True
+        glob="**/*.pdf",   # Recursively search for PDFs
+        loader_cls=PyPDFLoader
     )
     documents = loader.load()
     if not documents:
@@ -53,7 +50,7 @@ def create_vector_store():
     start_time = time.time()
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
-        model_kwargs={'device': 'cpu'} # Use CPU for broad compatibility
+        model_kwargs={'device': 'cpu'}  # Force CPU for broad compatibility
     )
     end_time = time.time()
     print(f"   Embedding model loaded in {end_time - start_time:.2f} seconds.")
@@ -62,13 +59,12 @@ def create_vector_store():
     print("\n4. Creating FAISS vector store from document chunks...")
     start_time = time.time()
     vectorstore = FAISS.from_documents(docs, embeddings)
-    
-    # Ensure the save directory exists
+
     os.makedirs(os.path.dirname(VECTORSTORE_PATH), exist_ok=True)
     vectorstore.save_local(VECTORSTORE_PATH)
     end_time = time.time()
     print(f"   Vector store created and saved to '{VECTORSTORE_PATH}' in {end_time - start_time:.2f} seconds.")
-    
+
     print("\n--- Vector Store Creation Complete! ---")
 
 if __name__ == "__main__":

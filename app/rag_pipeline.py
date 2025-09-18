@@ -1,142 +1,127 @@
 import os
-import torch
+import time
+import requests
+import json
+from threading import Thread
+from queue import Queue
+
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.llms import CTransformers
-from langchain.chains.retrieval_qa.base import RetrievalQA
 
 # --- Configuration ---
 VECTORSTORE_PATH = "vectorstore/faiss_index_agri"
-MODEL_PATH = "models/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-
-# --- Device Setup ---
 DEVICE = "cpu"
-print(f"🔹 Forcing device: {DEVICE}")
 
-def load_llm():
-    """Loads the quantized Mistral-7B model using CTransformers."""
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f"LLM model file not found at {MODEL_PATH}. "
-            "Please download it and place it in the 'models' directory."
-        )
-    
-    llm = CTransformers(
-        model=MODEL_PATH,
-        model_type="mistral",
-        config={
-            'max_new_tokens': 1024,
-            'temperature': 0.7,
-            'context_length': 4096
-        },
-        # Explicitly set gpu_layers to 0 to force CPU usage
-        gpu_layers=0  
-    )
-    return llm
+# --- Ollama API Config ---
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL = "gemma:2b"   # ✅ uses your local Ollama Gemma
+
+# --- Streaming Callback ---
+class QueueCallbackHandler:
+    """Custom handler that pushes streamed tokens into a queue from Ollama."""
+    def __init__(self, q):
+        self.q = q
 
 def create_rag_chain():
-    """Initializes and returns the RAG components."""
-    print("Loading embedding model...")
+    """Initializes retriever (FAISS + embeddings)."""
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
         model_kwargs={'device': DEVICE}
     )
-    print("✅ Embedding model loaded.")
-    
+
     if not os.path.exists(VECTORSTORE_PATH):
         raise FileNotFoundError(
-            f"Vector store not found at {VECTORSTORE_PATH}. "
-            "Please run create_vectorstore.py first."
+            f"Vector store not found at {VECTORSTORE_PATH}. Please run create_vectorstore.py first."
         )
 
-    print("Loading vector store...")
     vectorstore = FAISS.load_local(
         VECTORSTORE_PATH,
         embeddings,
         allow_dangerous_deserialization=True
     )
-    print("✅ Vector store loaded.")
-    
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    
-    prompt_template = """
-    First, provide a direct and concise answer to the user's question about farming in Punjab using the context below.
-    Then, add the separator '---' and provide a more detailed, step-by-step explanation based on the same context.
-    If you don't find the answer in the context, state that the information is not in your knowledge base.
-    Always answer in the same language as the user's question.
 
-    Context: {context}
-    Question: {question}
+    return retriever
 
-    Answer:
-    """
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+def build_prompt(context: str, question: str) -> str:
+    """Builds the prompt for Gemma with retrieved context."""
+    return f"""
+You are an expert agricultural extension officer for smallholder farmers in Punjab.
 
-    print("Loading LLM... (This may take a moment)")
-    llm = load_llm()
-    print("✅ LLM loaded.")
+INSTRUCTIONS:
+1) Use the provided CONTEXT to answer the user's QUESTION.
+    - If the CONTEXT contains direct, actionable information that answers the question, first give a concise DIRECT ANSWER (1–2 sentences).
+    - Then put a line with exactly three dashes: ---
+    - Then give a detailed, numbered STEP-BY-STEP EXPLANATION that references the context (quote brief snippets or say which document supports each step).
+    - End with a short "Sources" section listing the context documents used.
 
-    rag_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt}
-    )
-    
-    return rag_chain
+2) If the CONTEXT is empty or does not contain actionable information for this QUESTION:
+    - Still provide a concise DIRECT ANSWER (1–2 sentences) based on widely accepted agronomic best practices suitable for Punjab.
+    - Then put a line with exactly three dashes: ---
+    - Provide a numbered, practical STEP-BY-STEP GUIDANCE section that:
+      • Recommends what to do immediately (e.g., get a soil test, take a sample).
+      • Gives conservative, non-absolute guidance (e.g., mention types of fertilizer to consider, typical application methods like split N application, basal P application), and **avoid absolute numeric mandates**. If giving numbers, use clear ranges and units and label them as "typical range — confirm with soil test".
+      • Explicitly states safety/legal cautions and when to consult local extension services.
 
-def stream_rag_response(query: str, chain: RetrievalQA):
-    """
-    Performs the RAG steps and yields the LLM's response token by token.
-    
-    Args:
-        query: The user's question.
-        chain: The pre-configured RetrievalQA chain.
+3) ALWAYS:
+    - Answer in the same language as the user's question.
+    - Avoid over-confident absolute statements; use hedging when uncertain.
+    - Keep the DIRECT ANSWER short and actionable.
 
-    Yields:
-        str: Each token of the generated response.
-    """
-    try:
-        # 1. Retrieve relevant documents
-        docs = chain.retriever.invoke(query)
-        
-        if not docs:
-            yield "I couldn't find specific information on that topic in my knowledge base."
-            return
+Context:
+{context}
 
-        # 2. Format the context for the prompt
-        context = "\n\n".join([doc.page_content for doc in docs])
-        
-        # 3. Create the final prompt with the retrieved context
-        final_prompt = chain.combine_documents_chain.llm_chain.prompt.format(context=context, question=query)
+Question: {question}
 
-        # 4. Stream the response from the LLM
-        llm = chain.combine_documents_chain.llm_chain.llm
-        for token in llm.stream(final_prompt):
-            yield token
-    except Exception as e:
-        print(f"Error during streaming: {e}")
-        yield "An error occurred while generating the response."
+Answer:
+"""
 
-# This block is for direct testing and will not be used by the main FastAPI app.
-if __name__ == "__main__":
-    print("--- Testing RAG Pipeline Streaming ---")
-    try:
-        chain = create_rag_chain()
-        print("\n✅ RAG chain created successfully.")
-        
-        query_en = "What is the best fertilizer for wheat in Punjab?"
-        print(f"\nTesting with query: '{query_en}'")
-        
-        print("\n--- Streamed Response ---")
-        response_stream = stream_rag_response(query_en, chain)
-        for token in response_stream:
-            print(token, end="", flush=True)
-        print("\n--- End of Stream ---")
-        
-    except Exception as e:
-        print(f"\n❌ An error occurred during testing: {e}")
+def stream_rag_response(query: str):
+    """Generator that streams response from Ollama using FAISS + Gemma."""
+    q = Queue()
 
+    def run_chain_in_thread():
+        try:
+            retriever = create_rag_chain()
+            docs = retriever.get_relevant_documents(query)
+            context = "\n".join([doc.page_content for doc in docs])
+
+            prompt = build_prompt(context, query)
+
+            with requests.post(
+                OLLAMA_URL,
+                json={"model": MODEL, "prompt": prompt, "stream": True},
+                stream=True,
+            ) as r:
+                for line in r.iter_lines():
+                    if line:
+                        try:
+                            data = line.decode("utf-8")
+                            # Check if the line is a valid JSON object
+                            if data.startswith("{") and data.endswith("}"):
+                                obj = json.loads(data)
+                                if "response" in obj:
+                                    q.put(obj["response"])
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            # Ignore lines that are not valid JSON or can't be decoded
+                            continue
+            q.put(None)
+        except Exception as e:
+            print(f"ERROR in RAG chain thread: {e}")
+            q.put(e)
+
+    thread = Thread(target=run_chain_in_thread, daemon=True)
+    thread.start()
+
+    while True:
+        token = q.get()
+        if token is None:
+            break
+        if isinstance(token, Exception):
+            raise token
+        yield token
+        time.sleep(0.01)
+
+    thread.join()
